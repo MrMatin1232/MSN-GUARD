@@ -6,7 +6,6 @@ import android.graphics.Canvas
 import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Shader
-import android.graphics.Typeface
 import android.text.TextUtils
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
@@ -15,6 +14,7 @@ import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
@@ -143,14 +143,17 @@ class MetricTile(
             context.px(16),
         ).apply { topMargin = context.px(5) })
 
-        // A 2dp accent wash along the bottom edge. It is the cheapest way to make
-        // three otherwise identical tiles separable without reading them, and it
-        // doubles as the seam between the bars and the tile's lower rim.
+        // A 2dp accent wash below the bars. It is the cheapest way to make three
+        // otherwise identical tiles separable without reading them.
+        //
+        // The 9dp bottom margin is also the tile's bottom padding. It used to be
+        // carried by the sparkline's own margin, which is a fragile place to keep
+        // a layout invariant — anything added after the sparkline lost it.
         underglow = AccentUnderglow(context, accent, accentSecondary)
         addView(underglow, LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             context.px(3),
-        ).apply { topMargin = context.px(6) })
+        ).apply { topMargin = context.px(5); bottomMargin = context.px(9) })
 
         contentDescription = "$keyText 0 B"
     }
@@ -220,7 +223,7 @@ class MetricTile(
             // magnitude, and a linear map leaves this strip either off or
             // saturated with almost nothing in between.
             val next = (sample / (sample + 1f)).coerceIn(0f, 1f)
-            if (kotlin.math.abs(next - intensity) < 0.01f) return
+            if (abs(next - intensity) < 0.01f) return
             intensity = next
             invalidate()
         }
