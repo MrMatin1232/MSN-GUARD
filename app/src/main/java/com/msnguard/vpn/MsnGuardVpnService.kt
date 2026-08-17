@@ -8,85 +8,36 @@ import android.app.Service
 import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.service.quicksettings.TileService
-import android.net.IpPrefix
-import android.net.ProxyInfo
 import android.net.VpnService
 import android.os.Build
-import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
+import android.service.quicksettings.TileService
 import android.util.Log
-import org.json.JSONArray
+import ca.psiphon.PsiphonTunnel
 import org.json.JSONObject
-import java.net.InetAddress
-import java.util.ArrayDeque
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import ca.psiphon.PsiphonTunnel
 
 /**
- * Protocol sets shared between a rung's config and its winner-detection.
+ * The tunnel's lifecycle owner: foreground notification, TUN interface, Psiphon
+ * controller, escalation ladder and traffic accounting.
  *
- * Declared top-level (not in the companion) so the ladder property initializer
- * can reference them without depending on companion init order.
+ * Three things that used to live here now do not, because none of them are about
+ * lifecycle:
  *
- * Every name here was verified to exist as a substring in libgojni.so. The
- * INPROXY-* names are deliberately absent: they are assembled at runtime and do
- * not appear as literals, so passing one risks failing config validation.
+ *  * [PsiphonLadder]        — the rung definitions and their carrier tuning
+ *  * [applyDns] and friends — everything that shapes the TUN (VpnInterfaceBuilder.kt)
+ *  * [ConnectionLog]        — the app-wide event buffer, used by four callers
+ *  * [ByteFormat]           — counter formatting
  */
-private val PROTOCOLS_FRONTED = listOf(
-    "FRONTED-MEEK-OSSH",
-    "FRONTED-MEEK-HTTP-OSSH",
-    "FRONTED-MEEK-QUIC-OSSH",
-)
-
-/**
- * Direct-dial protocols, i.e. everything that connects straight to a Psiphon
- * server IP. Used only for winner detection — the direct rung passes no
- * protocol limit at all and lets Psiphon pick.
- */
-private val PROTOCOLS_DIRECT = listOf(
-    "QUIC-OSSH",
-    "TLS-OSSH",
-    "UNFRONTED-MEEK-HTTPS-OSSH",
-    "UNFRONTED-MEEK-OSSH",
-    "SHADOWSOCKS-OSSH",
-    "CONJURE-OSSH",
-    "OSSH",
-    "SSH",
-)
-
-/**
- * One rung of the Psiphon escalation ladder.
- *
- * Each rung is a complete, self-contained Psiphon config variant plus the time
- * we are willing to spend on it before moving to the next rung. The ladder is
- * ordered by *expected time to first connection on a hostile carrier*, not by
- * how clever the technique is — the cheapest thing that plausibly works goes
- * first so the common case stays fast.
- */
-private class PsiphonStrategy(
-    val name: String,
-    val label: String,
-    val timeoutSeconds: Int,
-    /**
-     * Protocols this rung asks Psiphon to try first.
-     *
-     * This is only a *preference*: Psiphon falls back to its full protocol set
-     * once InitialLimitTunnelProtocolsCandidateCount candidates are exhausted.
-     * So the protocol that ends up carrying the tunnel is often not from this
-     * list, which is exactly why winner detection reads the live ActiveTunnel
-     * notice instead of assuming the active rung won.
-     */
-    val preferredProtocols: List<String>,
-    val configure: (JSONObject) -> Unit,
-)
-
 class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.HostService {
     private val worker: ExecutorService = Executors.newSingleThreadExecutor()
     private val connected = AtomicBoolean(false)
@@ -103,6 +54,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
     private var currentSpeedRx = 0L
     private var accountedTx = 0L
     private var accountedRx = 0L
+
     /**
      * Monthly totals held in memory, flushed to disk on a timer.
      *
@@ -127,6 +79,17 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
     private var currentPing = ""
     private var psiphonTunnel: PsiphonTunnel? = null
     private var psiphonConfigJson: String = ""
+
+    /**
+     * True for the whole life of a Psiphon session, false for every other
+     * protocol.
+     *
+     * MUST be reassigned on every [startTunnel]. It used to be set to true on the
+     * Psiphon branch and never cleared, so after one Psiphon session every
+     * subsequent MASQUE / WireGuard / WoW disconnect took the Psiphon teardown
+     * path in [stopTunnel] — closing the TUN and calling stopSelf() while the
+     * native worker's own `finally` block was about to do the same.
+     */
     private var psiphonVpnMode = false
     private var psiphonVpnActivated = false
     private var activeSocksPort = 0
@@ -141,102 +104,14 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
     // first rung of the ladder will time out. Rather than sitting on one config
     // for two minutes and giving up, we walk the ladder automatically: each rung
     // gets its own budget, and a timeout promotes us to the next rung without
-    // any user interaction.
+    // any user interaction. The rungs themselves live in PsiphonLadder.kt.
     private val ladderScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
+    private val psiphonLadder: List<PsiphonStrategy> = PsiphonLadder.RUNGS
     private var ladderIndex = 0
     private var ladderAttempts = 0
     private var ladderTimer: ScheduledFuture<*>? = null
     private val ladderActive = AtomicBoolean(false)
     private val attributionPending = AtomicBoolean(false)
-
-    /**
-     * The escalation ladder, ordered by *measured* time-to-connect on a hostile
-     * carrier, using the Build #65 field logs from Hamrah-e-Aval and SamanTel.
-     *
-     * What those logs proved:
-     *
-     *  - On Hamrah-e-Aval every direct dial fails at the TCP layer:
-     *    TLS-OSSH, UNFRONTED-MEEK-HTTPS-OSSH, OSSH and SSH candidates all end in
-     *    "connect: connection timed out" / "i/o timeout" from tcpDial#308. Not
-     *    resets, not TLS errors — the packets never arrive. The carrier
-     *    null-routes Psiphon server IPs.
-     *  - Only FRONTED-MEEK works there, because it dials a CDN edge instead of a
-     *    Psiphon-owned IP. It connected on FRONTED-MEEK-HTTP-OSSH in 33s.
-     *  - The old first rung ("443-only protocols") therefore burned its entire
-     *    45s budget for nothing before the fronted rung even started, which is
-     *    the whole reason connecting felt slow.
-     *  - On SamanTel a plain direct QUIC-OSSH dial won in seconds, so direct
-     *    protocols must stay reachable early for carriers that do not block.
-     *
-     * Hence the order: fronted first (the only path that works on the hostile
-     * carrier), then wide-open direct (fast where nothing is blocked), then
-     * in-proxy (slowest, needs a broker plus WebRTC/ICE negotiation).
-     *
-     * The rung that actually carries the tunnel is remembered per device, so
-     * after one successful connect each SIM starts on its own best rung and the
-     * ordering here only matters for the very first attempt.
-     */
-    private val psiphonLadder: List<PsiphonStrategy> = listOf(
-        PsiphonStrategy(
-            name = "A",
-            label = "domain-fronted (CDN)",
-            timeoutSeconds = 60,
-            preferredProtocols = PROTOCOLS_FRONTED,
-        ) { config ->
-            // Fronted protocols terminate on an Amazon/Cloudflare edge address,
-            // never on a Psiphon-owned IP, so a carrier IP blocklist cannot see
-            // or drop them. They do need working DNS to resolve the front, which
-            // is what the public resolvers on the TUN provide.
-            //
-            // Only 5 of the 430 bundled server entries advertise FRONTED-MEEK
-            // (4x US, 1x GB) — that is why a fronted connection always lands in
-            // the US. A low candidate count keeps Psiphon cycling those few
-            // entries with fresh dial parameters instead of opening up to the
-            // 425 direct entries that are known-dead on this carrier.
-            config.put("InitialLimitTunnelProtocols", JSONArray(PROTOCOLS_FRONTED))
-            config.put("InitialLimitTunnelProtocolsCandidateCount", 30)
-            config.put("ConnectionWorkerPoolSize", 12)
-            // CDN paths are legitimately slower than a direct dial; without this
-            // Psiphon abandons them as if they were dead.
-            config.put("NetworkLatencyMultiplier", 2.0)
-        },
-        PsiphonStrategy(
-            name = "D",
-            label = "all protocols (direct)",
-            timeoutSeconds = 45,
-            preferredProtocols = PROTOCOLS_DIRECT,
-        ) { config ->
-            // No InitialLimitTunnelProtocols at all: Psiphon uses its own full
-            // protocol set and its own replay/tactics ordering. This is the rung
-            // that wins on a carrier which is not blocking anything — SamanTel
-            // connected this way on QUIC-OSSH — and it is also the safety net if
-            // the CDN fronts themselves ever get blocked.
-            config.put("ConnectionWorkerPoolSize", 16)
-        },
-        PsiphonStrategy(
-            name = "C",
-            label = "in-proxy (peer relay)",
-            timeoutSeconds = 75,
-            preferredProtocols = emptyList(),
-        ) { config ->
-            // In-proxy routes through other Psiphon users' devices over WebRTC.
-            // Their addresses are residential and not in any carrier blocklist,
-            // which is what makes this rung the last resort that can still work
-            // when every server IP and every CDN front is unreachable.
-            //
-            // Deliberately NOT setting InitialLimitTunnelProtocols here: the
-            // INPROXY-* protocol names do not exist as literals in libgojni.so
-            // (verified with strings — they are assembled at runtime), so passing
-            // one risks failing config validation and killing the whole rung.
-            // The flags below are enough; the log confirms Psiphon then reports
-            // "in-proxy protocol preferred" and dials INPROXY-WEBRTC-OSSH itself.
-            config.put("InproxyEnabled", true)
-            config.put("InproxyAllowClient", true)
-            config.put("InproxySkipAwaitFullyConnected", true)
-            config.put("ConnectionWorkerPoolSize", 16)
-            config.put("NetworkLatencyMultiplier", 3.0)
-        },
-    )
 
     companion object {
         const val LOG_TAG = "MsnGuardVpnService"
@@ -285,6 +160,12 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
          */
         private const val NOTIFICATION_UPDATE_MS = 5_000L
 
+        /** Minimum gap between traffic samples we act on, in ms. */
+        private const val TRAFFIC_SAMPLE_MIN_MS = 900L
+
+        /** Grace added on top of a rung's own budget before the watchdog fires. */
+        private const val LADDER_GRACE_SECONDS = 8L
+
         /**
          * elapsedRealtime at the moment the tunnel last reached CONNECTED, or 0
          * when it is down. The activity reads this so a session timer survives
@@ -301,7 +182,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         fun connectedSinceElapsed(): Long = connectedSince
     }
 
-    override fun onBind(intent: Intent?): IBinder? = super.onBind(intent)
+    // ---------------------------------------------------------------- Psiphon
 
     override fun bindToDevice(fd: Long) {
         if (!protect(fd.toInt())) {
@@ -373,13 +254,14 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         // to be overwritten by the first traffic sample from the Rust core; with
         // tun2socks the first sample can be seconds away, so the notification
         // would sit on "Connecting..." while the device was fully tunnelled.
-        getSystemService(NotificationManager::class.java)
-            .notify(NOTIFICATION_ID, notification(currentTx, currentRx))
+        postNotification()
         sendStatus(STATUS_CONNECTED)
     }
 
     override fun onExiting() {
         ConnectionLog.record("Psiphon exiting")
+        // The Go controller has already unwound by the time this fires, so the
+        // handle is dead: drop it rather than calling stop() on it again.
         psiphonTunnel = null
         // Psiphon hit its own EstablishTunnelTimeout and shut the controller down.
         // That is the definitive "this rung is dead" signal, and it arrives before
@@ -451,7 +333,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
     private fun buildPsiphonConfig(): String {
         // Fixed port so the TUN can be pre-created before Psiphon starts.
         val socksPort = CoreConfig.SOCKS_PORT
-        val config = org.json.JSONObject().apply {
+        val config = JSONObject().apply {
             put("PropagationChannelId", "FFFFFFFFFFFFFFFF")
             put("SponsorId", "1111111111111111")
             put("EgressRegion", "")
@@ -517,7 +399,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             psiphonTunnel = tunnel
             psiphonConfigJson = buildPsiphonConfig()
 
-            // Load hex-encoded server entries from assets
+            // Hex-encoded server entries bundled in assets.
             val serverEntries = try {
                 assets.open("server_entries.txt").bufferedReader().readText().trim()
             } catch (e: Exception) {
@@ -525,8 +407,8 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 ""
             }
             // Fire-and-forget: Psiphon connects asynchronously.
-            // onListeningSocksProxyPort() saves the port.
-            // onConnected() starts the Rust core to bridge TUN → SOCKS.
+            // onListeningSocksProxyPort() saves the port, onConnected() starts
+            // tun2socks.
             tunnel.startTunneling(serverEntries)
             ConnectionLog.record("Psiphon tunnel starting...")
             armLadderTimer()
@@ -548,9 +430,9 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         val strategy = psiphonLadder.getOrNull(ladderIndex) ?: return
         cancelLadderTimer()
         ladderActive.set(true)
-        // +8s grace so Psiphon's internal timeout and teardown land first; racing
-        // it would restart the tunnel while the old controller is still stopping.
-        val budget = strategy.timeoutSeconds.toLong() + 8L
+        // Grace so Psiphon's internal timeout and teardown land first; racing it
+        // would restart the tunnel while the old controller is still stopping.
+        val budget = strategy.timeoutSeconds.toLong() + LADDER_GRACE_SECONDS
         ladderTimer = ladderScheduler.schedule({
             if (ladderActive.get() && !psiphonVpnActivated) escalateLadder()
         }, budget, TimeUnit.SECONDS)
@@ -611,7 +493,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
      */
     private fun recordLadderWinner(rungAtConnect: Int) {
         val protocol = activeTunnelProtocol
-        val inproxyRung = psiphonLadder.indexOfFirst { it.name == "C" }
+        val inproxyRung = PsiphonLadder.INPROXY_RUNG
 
         val (winnerIndex, reason) = when {
             // The protocol name is the strongest signal available. An INPROXY-*
@@ -723,6 +605,8 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         }, "psiphon-stop").start()
     }
 
+    // -------------------------------------------------------------- lifecycle
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_CONNECT -> intent.getStringExtra(EXTRA_CONFIG)?.let { config ->
@@ -743,8 +627,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             ACTION_NOTIFICATION_HEALTH -> {
                 intent.getStringExtra(EXTRA_NOTIFICATION_IP)?.let { currentVpnIp = it }
                 intent.getStringExtra(EXTRA_NOTIFICATION_PING)?.let { currentPing = it }
-                getSystemService(NotificationManager::class.java)
-                    .notify(NOTIFICATION_ID, notification(currentTx, currentRx))
+                postNotification()
             }
         }
         return Service.START_REDELIVER_INTENT
@@ -758,6 +641,11 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         super.onDestroy()
     }
 
+    /**
+     * Called from the native core to keep a socket off the TUN.
+     *
+     * Public and un-obfuscated on purpose: the Rust side resolves it by name.
+     */
     fun protectSocket(fd: Int): Boolean = !vpnModeActive.get() || protect(fd)
 
     override fun onEvent(json: String) {
@@ -788,14 +676,10 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                         // The country is resolved by the UI from this address; the
                         // core cannot tell one from inside the tunnel.
                         sendExitIp(ip)
-                        getSystemService(NotificationManager::class.java)
-                            .notify(NOTIFICATION_ID, notification(currentTx, currentRx))
+                        postNotification()
                     }
                 }
-                "log" -> {
-                    val message = event.getString("message")
-                    ConnectionLog.record(message)
-                }
+                "log" -> ConnectionLog.record(event.getString("message"))
             }
         } catch (e: Exception) {
             Log.e(LOG_TAG, "Failed to parse event: $json", e)
@@ -812,6 +696,12 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         currentProtocol = config.substringAfter("\"protocol\":\"").substringBefore('"').uppercase()
         currentVpnIp = ""
         currentPing = ""
+        // Derived here, on EVERY start, and not only inside the Psiphon branch.
+        // Leaving a stale `true` behind sent the next non-Psiphon disconnect down
+        // the Psiphon teardown path in stopTunnel(), which closes the TUN and
+        // calls stopSelf() while the native worker's own finally block is doing
+        // the same thing.
+        psiphonVpnMode = currentProtocol.contains("PSIPHON")
         // Every new tunnel makes the core start counting bytes from zero again
         // (rx_total/tx_total are locals inside tun::bridge). Anything here that
         // still holds the previous session's totals would then be compared
@@ -823,9 +713,9 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         startAsForeground()
 
         // PSIPHON: callback-driven lifecycle — MUST NOT enter try/finally.
-        // The finally block calls stopSelf() which destroys the service and kills Psiphon.
-        if (currentProtocol.contains("PSIPHON")) {
-            psiphonVpnMode = true  // Read by onConnected() to start tun2socks
+        // The finally block calls stopSelf(), which destroys the service and kills
+        // Psiphon before it has finished establishing.
+        if (psiphonVpnMode) {
             psiphonVpnActivated = false
             // Start from the rung that last worked on this device. On the first
             // ever connect, or after a full ladder failure, this is rung 0.
@@ -833,130 +723,137 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 .getInt("psiphon_winning_strategy", 0)
                 .coerceIn(0, psiphonLadder.size - 1)
             ladderAttempts = 0
-            worker.execute {
-                try {
-                    ConnectionLog.record("Preparing PSIPHON identity")
-                    // Create the TUN first, then start Psiphon: this stops Psiphon's
-                    // NetworkMonitor seeing tun0 appear as a network change, which
-                    // used to cause a 13-second restart loop.
-                    val socksPort = CoreConfig.SOCKS_PORT
-
-                    // Address plan comes from tun2socks: the interface gets
-                    // .ipAddress while lwIP answers on .router, which is also
-                    // the DNS resolver the system will use. These must not be
-                    // swapped or lwIP drops every packet.
-                    val address = Tun2SocksManager.selectPrivateAddress()
-
-                    ConnectionLog.record("Creating TUN interface BEFORE Psiphon starts")
-                    tun = Builder()
-                        .setSession("MSN-GUARD")
-                        .setMtu(Tun2SocksManager.VPN_INTERFACE_MTU)
-                        .addAddress(address.ipAddress, address.prefixLength)
-                        .addRoute("0.0.0.0", 0)
-                        .addRoute(address.subnet, address.prefixLength)
-                        .addDnsServer(address.router)
-                        // --- Strategy A: break the DNS bootstrap deadlock ---
-                        // With only address.router as a resolver, every DNS
-                        // query goes lwIP → udpgw → Psiphon. Before a tunnel
-                        // exists there is nothing on the far end, so DNS is
-                        // dead exactly when Psiphon needs it to resolve the
-                        // CDN hostnames that FRONTED-MEEK depends on. The log
-                        // showed this as "resp 0/0" with 20-second RTTs and
-                        // four consecutive "resolve canceled" tactics failures.
-                        //
-                        // Listing public resolvers as additional DNS servers
-                        // gives the resolver somewhere to go. Combined with
-                        // addDisallowedApplication(packageName) below — which
-                        // keeps our own process off the TUN entirely — Psiphon's
-                        // queries leave over the carrier link and resolve
-                        // normally, so the fronted protocols become usable.
-                        .addDnsServer("1.1.1.1")
-                        .addDnsServer("8.8.8.8")
-                        .addDisallowedApplication(packageName)
-                        .establish() ?: error("Android could not establish the VPN interface")
-                    vpnModeActive.set(true)
-                    ConnectionLog.record("TUN ready — now starting Psiphon on port $socksPort")
-                    // Pre-save the SOCKS port so onConnected() can start tun2socks immediately.
-                    activeSocksPort = socksPort
-                    startPsiphonTunnel()
-                    sendStatus(STATUS_CONNECTING, "Psiphon starting...")
-                } catch (e: Exception) {
-                    ConnectionLog.record("Psiphon start failed: ${e.message}")
-                    sendStatus(STATUS_FAILED, e.message)
-                    connected.set(false)
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
-                }
-            }
+            worker.execute { startPsiphonSession() }
             return
         }
 
-        worker.execute {
-            try {
-                ConnectionLog.record("Preparing $currentProtocol identity")
-                NativeCore.attach(this)
-                // VPN mode is the only mode, so the Rust core always binds the
-                // Android TUN directly — there is no proxy branch any more.
-                val addresses = NativeCore.prepare(config)
-                if (addresses.organization.isNotBlank()) {
-                    ConnectionLog.record("Zero Trust organization ${addresses.organization}")
-                }
-                ConnectionLog.record("Creating Android VPN interface")
-                tun = Builder()
-                    .setSession("MSN-GUARD")
-                    .setMtu(1280)
-                    // applyTunnelAddresses replaces the hardcoded /32 + /128
-                    // pair: v0.8.0 identities can carry a real prefix length,
-                    // and a WARP identity without a v6 address must not get a
-                    // v6 default route.
-                    .applyTunnelAddresses(addresses)
-                    .applyDns(config, addresses)
-                    .applyGatewayProxy(config, addresses)
-                    .applyLanAccess(addresses)
-                    .applySplitTunneling()
-                    // applySplitTunneling() handles app exclusion per mode.
-                    .establish() ?: error("Android could not establish the VPN interface")
-                ConnectionLog.record("Scanning gateways for VPN")
-                // The Rust core is about to bind this TUN fd directly, which
-                // means no local SOCKS listener will exist for this session.
-                // The UI health check must go direct, not via 127.0.0.1.
-                TunnelStatus.isNativeTunMode = true
-                val result = NativeCore.start(config, tun!!.fd)
+        worker.execute { startNativeSession(config) }
+    }
 
-                if (result != 0 && !stopRequested.get()) {
-                    val detail = NativeCore.lastError().ifBlank { "Tunnel exited with code $result" }
-                    ConnectionLog.record("Native tunnel exited: $detail")
-                    sendStatus(STATUS_FAILED, detail)
-                } else if (stopRequested.get()) {
-                    sendStatus(STATUS_DISCONNECTED)
-                } else {
-                    ConnectionLog.record("Native tunnel stopped unexpectedly")
-                    sendStatus(STATUS_FAILED, "Tunnel stopped unexpectedly")
-                }
-            } catch (error: Exception) {
-                val detail = NativeCore.lastError().ifBlank { error.message ?: "Tunnel setup failed" }
-                Log.e(LOG_TAG, "Tunnel failed: $detail", error)
-                sendStatus(STATUS_FAILED, detail)
-            } finally {
-                NativeCore.detach()
-                vpnModeActive.set(false)
-                TunnelStatus.isNativeTunMode = false
-                val killSwitch = getSharedPreferences("settings", MODE_PRIVATE).getBoolean("kill_switch", false)
-                tun?.close()
-                tun = null
-                connected.set(false)
-                if (killSwitch && !stopRequested.get()) {
-                    ConnectionLog.record("Kill switch active; blocking all traffic")
-                    sendStatus(STATUS_FAILED, "Kill switch active — tunnel dropped")
-                    rebuildKillSwitchVpn()
-                } else {
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
-                }
-            }
+    /**
+     * Psiphon path: create the TUN first, then start the Go controller.
+     *
+     * Order matters. Creating the TUN after Psiphon starts makes Psiphon's
+     * NetworkMonitor see tun0 appear as a network change, which used to cause a
+     * 13-second restart loop.
+     */
+    private fun startPsiphonSession() {
+        try {
+            ConnectionLog.record("Preparing PSIPHON identity")
+            val socksPort = CoreConfig.SOCKS_PORT
+
+            // Address plan comes from tun2socks: the interface gets .ipAddress
+            // while lwIP answers on .router, which is also the DNS resolver the
+            // system will use. These must not be swapped or lwIP drops every
+            // packet.
+            val address = Tun2SocksManager.selectPrivateAddress()
+
+            ConnectionLog.record("Creating TUN interface BEFORE Psiphon starts")
+            tun = Builder()
+                .setSession("MSN-GUARD")
+                .setMtu(Tun2SocksManager.VPN_INTERFACE_MTU)
+                .addAddress(address.ipAddress, address.prefixLength)
+                .addRoute("0.0.0.0", 0)
+                .addRoute(address.subnet, address.prefixLength)
+                .addDnsServer(address.router)
+                // --- Break the DNS bootstrap deadlock ---
+                // With only address.router as a resolver, every DNS query goes
+                // lwIP → udpgw → Psiphon. Before a tunnel exists there is nothing
+                // on the far end, so DNS is dead exactly when Psiphon needs it to
+                // resolve the CDN hostnames FRONTED-MEEK depends on. The log
+                // showed this as "resp 0/0" with 20-second RTTs and four
+                // consecutive "resolve canceled" tactics failures.
+                //
+                // Public resolvers give the resolver somewhere to go. Combined
+                // with addDisallowedApplication(packageName) below — which keeps
+                // our own process off the TUN entirely — Psiphon's queries leave
+                // over the carrier link and resolve normally, so the fronted
+                // protocols become usable.
+                .addDnsServer("1.1.1.1")
+                .addDnsServer("8.8.8.8")
+                .addDisallowedApplication(packageName)
+                .establish() ?: error("Android could not establish the VPN interface")
+            vpnModeActive.set(true)
+            ConnectionLog.record("TUN ready — now starting Psiphon on port $socksPort")
+            // Pre-save the SOCKS port so onConnected() can start tun2socks immediately.
+            activeSocksPort = socksPort
+            startPsiphonTunnel()
+            sendStatus(STATUS_CONNECTING, "Psiphon starting...")
+        } catch (e: Exception) {
+            ConnectionLog.record("Psiphon start failed: ${e.message}")
+            sendStatus(STATUS_FAILED, e.message)
+            connected.set(false)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
         }
     }
 
+    /**
+     * Native path (MASQUE / WireGuard / WoW): the Rust core binds the Android TUN
+     * directly, so no local SOCKS listener exists for this session.
+     */
+    private fun startNativeSession(config: String) {
+        try {
+            ConnectionLog.record("Preparing $currentProtocol identity")
+            NativeCore.attach(this)
+            val addresses = NativeCore.prepare(config)
+            if (addresses.organization.isNotBlank()) {
+                ConnectionLog.record("Zero Trust organization ${addresses.organization}")
+            }
+            ConnectionLog.record("Creating Android VPN interface")
+            tun = Builder()
+                .setSession("MSN-GUARD")
+                .setMtu(1280)
+                .applyTunnelAddresses(addresses)
+                .applyDns(config, addresses)
+                .applyGatewayProxy(config, addresses)
+                .applyLanAccess(this, addresses)
+                // Handles app exclusion per mode, including keeping ourselves off
+                // the TUN.
+                .applySplitTunneling(this)
+                .establish() ?: error("Android could not establish the VPN interface")
+            ConnectionLog.record("Scanning gateways for VPN")
+            // The Rust core is about to bind this TUN fd directly, which means no
+            // local SOCKS listener will exist for this session. The UI health
+            // check must go direct, not via 127.0.0.1.
+            TunnelStatus.isNativeTunMode = true
+            val result = NativeCore.start(config, tun!!.fd)
+
+            when {
+                stopRequested.get() -> sendStatus(STATUS_DISCONNECTED)
+                result != 0 -> {
+                    val detail = NativeCore.lastError().ifBlank { "Tunnel exited with code $result" }
+                    ConnectionLog.record("Native tunnel exited: $detail")
+                    sendStatus(STATUS_FAILED, detail)
+                }
+                else -> {
+                    ConnectionLog.record("Native tunnel stopped unexpectedly")
+                    sendStatus(STATUS_FAILED, "Tunnel stopped unexpectedly")
+                }
+            }
+        } catch (error: Exception) {
+            val detail = NativeCore.lastError().ifBlank { error.message ?: "Tunnel setup failed" }
+            Log.e(LOG_TAG, "Tunnel failed: $detail", error)
+            sendStatus(STATUS_FAILED, detail)
+        } finally {
+            NativeCore.detach()
+            vpnModeActive.set(false)
+            TunnelStatus.isNativeTunMode = false
+            val killSwitch = getSharedPreferences("settings", MODE_PRIVATE)
+                .getBoolean("kill_switch", false)
+            tun?.close()
+            tun = null
+            connected.set(false)
+            if (killSwitch && !stopRequested.get()) {
+                ConnectionLog.record("Kill switch active; blocking all traffic")
+                sendStatus(STATUS_FAILED, "Kill switch active — tunnel dropped")
+                rebuildKillSwitchVpn()
+            } else {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+        }
+    }
 
     private fun stopTunnel(notify: Boolean = true, teardownService: Boolean = true) {
         stopRequested.set(true)
@@ -986,6 +883,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             NativeCore.detach()
             vpnModeActive.set(false)
             psiphonVpnActivated = false
+            psiphonVpnMode = false
             tun?.close()
             tun = null
             connected.set(false)
@@ -999,6 +897,8 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             return
         }
 
+        // Native path: startNativeSession()'s finally block owns the rest of the
+        // teardown, because NativeCore.start() is still unwinding on the worker.
         if (notify && !connected.get()) sendStatus(STATUS_DISCONNECTED)
     }
 
@@ -1021,6 +921,8 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         }
     }
 
+    // ------------------------------------------------------------ broadcasts
+
     private fun sendStatus(status: String, detail: String? = null) {
         Log.i(LOG_TAG, "status=$status${detail?.let { " detail=$it" } ?: ""}")
         // Stamp the connect moment here rather than at each call site: there are
@@ -1040,6 +942,32 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         )
     }
 
+    private fun sendTraffic(tx: Long, rx: Long, monthTx: Long, monthRx: Long) {
+        sendBroadcast(Intent(ACTION_STATUS)
+            .setPackage(packageName)
+            .putExtra(EXTRA_TRAFFIC_TX, tx)
+            .putExtra(EXTRA_TRAFFIC_RX, rx)
+            .putExtra(EXTRA_TRAFFIC_SPEED_TX, currentSpeedTx)
+            .putExtra(EXTRA_TRAFFIC_SPEED_RX, currentSpeedRx)
+            .putExtra(EXTRA_TRAFFIC_MONTH_TX, monthTx)
+            .putExtra(EXTRA_TRAFFIC_MONTH_RX, monthRx))
+    }
+
+    /**
+     * Broadcasts the core-measured exit address to the UI.
+     *
+     * Address only. The country is a geolocation question, which the UI answers
+     * over whatever link it has — the answer for a given address is the same
+     * either way, so it does not need to be asked from inside the tunnel.
+     */
+    private fun sendExitIp(ip: String) {
+        sendBroadcast(Intent(ACTION_STATUS)
+            .setPackage(packageName)
+            .putExtra(EXTRA_EXIT_IP, ip))
+    }
+
+    // --------------------------------------------------------------- traffic
+
     private fun updateTrafficNotification(tx: Long, rx: Long) {
         val now = SystemClock.elapsedRealtime()
         // The core's counters are per-tunnel locals, and the core reconnects on
@@ -1058,7 +986,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             currentSpeedTx = 0
             currentSpeedRx = 0
         }
-        if (now - lastTrafficSampleMs < 900) return
+        if (now - lastTrafficSampleMs < TRAFFIC_SAMPLE_MIN_MS) return
 
         val elapsed = now - prevSpeedSampleMs
         if (elapsed > 0 && prevSpeedSampleMs > 0) {
@@ -1088,8 +1016,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         // reading them per-second from a collapsed notification. Every few seconds
         // conveys the same thing.
         if (now - lastNotificationUpdateMs >= NOTIFICATION_UPDATE_MS) {
-            getSystemService(NotificationManager::class.java)
-                .notify(NOTIFICATION_ID, notification(tx, rx))
+            postNotification()
             lastNotificationUpdateMs = now
         }
         lastTrafficSampleMs = now
@@ -1098,10 +1025,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
     /**
      * Adds this sample to the monthly totals, in memory.
      *
-     * The disk write is deliberately not here — see [flushMonthlyTraffic] and the
-     * fields it persists. The date is also only formatted when the month is not
-     * already known, because building a SimpleDateFormat once a second to
-     * re-derive the same string is waste in its own right.
+     * The disk write is deliberately not here — see [flushMonthlyTraffic].
      */
     private fun recordMonthlyTraffic(tx: Long, rx: Long): Pair<Long, Long> {
         // First sample of this process, or the month rolled over mid-session.
@@ -1112,7 +1036,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
     }
 
     private fun currentMonthKey(): String =
-        java.text.SimpleDateFormat("yyyy-MM", java.util.Locale.US).format(java.util.Date())
+        SimpleDateFormat("yyyy-MM", Locale.US).format(Date())
 
     /** Loads the persisted monthly totals into memory, once per month key. */
     private fun loadMonthlyTotals() {
@@ -1140,9 +1064,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
      * a process the gate demanded that a counter starting from zero exceed the
      * *previous* session's final total. It never could, so verification always
      * timed out after 18s and the UI reported "handshake succeeded but nothing
-     * passes" for a tunnel that was working. Force-stopping the app made the
-     * first connect succeed again because fresh fields start at zero — which is
-     * exactly the workaround that was being used.
+     * passes" for a tunnel that was working.
      *
      * The monthly totals are deliberately NOT cleared: they are cumulative
      * across sessions. Only the per-session deltas reset, and `accountedTx/Rx`
@@ -1190,49 +1112,14 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             .apply()
     }
 
-    private fun sendTraffic(tx: Long, rx: Long, monthTx: Long, monthRx: Long) {
-        sendBroadcast(Intent(ACTION_STATUS)
-            .setPackage(packageName)
-            .putExtra(EXTRA_TRAFFIC_TX, tx)
-            .putExtra(EXTRA_TRAFFIC_RX, rx)
-            .putExtra(EXTRA_TRAFFIC_SPEED_TX, currentSpeedTx)
-            .putExtra(EXTRA_TRAFFIC_SPEED_RX, currentSpeedRx)
-            .putExtra(EXTRA_TRAFFIC_MONTH_TX, monthTx)
-            .putExtra(EXTRA_TRAFFIC_MONTH_RX, monthRx))
-    }
-
-    /**
-     * Broadcasts the core-measured exit address to the UI.
-     *
-     * Address only. The country is a geolocation question, which the UI answers
-     * over whatever link it has — the answer for a given address is the same
-     * either way, so it does not need to be asked from inside the tunnel.
-     */
-    private fun sendExitIp(ip: String) {
-        sendBroadcast(Intent(ACTION_STATUS)
-            .setPackage(packageName)
-            .putExtra(EXTRA_EXIT_IP, ip))
-    }
-
-    private fun formatBytes(bytes: Long): String = when {
-        bytes < 1_024 -> "$bytes B"
-        bytes < 1_048_576 -> "${bytes / 1_024} KB"
-        bytes < 1_073_741_824 -> "${bytes / 1_048_576} MB"
-        else -> String.format(java.util.Locale.US, "%.2f GB", bytes / 1_073_741_824.toDouble())
-    }
-
-    private fun formatSpeed(bytesPerSec: Long): String = when {
-        bytesPerSec < 1_024 -> "$bytesPerSec B/s"
-        bytesPerSec < 1_048_576 -> "${bytesPerSec / 1_024} KB/s"
-        else -> String.format(java.util.Locale.US, "%.1f MB/s", bytesPerSec / 1_048_576.0)
-    }
+    // ---------------------------------------------------------- notification
 
     private fun startAsForeground() {
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel(
             CHANNEL_ID,
             "VPN Service",
-            NotificationManager.IMPORTANCE_LOW
+            NotificationManager.IMPORTANCE_LOW,
         ))
         val notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("MSN-GUARD")
@@ -1241,7 +1128,24 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             .setOngoing(true)
             .setCategory(Notification.CATEGORY_SERVICE)
             .build()
-        startForeground(NOTIFICATION_ID, notification)
+        // Declare the type explicitly where the platform supports it. The manifest
+        // already declares dataSync, but stating it at the call site is what makes
+        // a mismatch fail loudly at startForeground() instead of silently at some
+        // later restriction check.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun postNotification() {
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIFICATION_ID, notification(currentTx, currentRx))
     }
 
     private fun notification(tx: Long, rx: Long): Notification {
@@ -1249,7 +1153,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
         val pendingIntent = PendingIntent.getActivity(
-            this, 0, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            this, 0, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
 
         val disconnectIntent = Intent(this, MsnGuardVpnService::class.java).apply {
@@ -1257,263 +1161,36 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             putExtra(EXTRA_CONFIG, storedConfig ?: "")
         }
         val disconnectPendingIntent = PendingIntent.getService(
-            this, 1, disconnectIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            this, 1, disconnectIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
 
         val reconnectIntent = Intent(this, MsnGuardVpnService::class.java).apply {
             action = ACTION_RECONNECT
         }
         val reconnectPendingIntent = PendingIntent.getService(
-            this, 2, reconnectIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            this, 2, reconnectIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
 
-        return Notification.Builder(this, CHANNEL_ID)
+        val builder = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("MSN-GUARD")
-            .setContentText("VPN: $currentProtocol • ${formatBytes(tx)}↑ ${formatBytes(rx)}↓ • ${formatSpeed(currentSpeedTx)}↑ ${formatSpeed(currentSpeedRx)}↓")
+            .setContentText(
+                "VPN: $currentProtocol • ${ByteFormat.bytes(tx)}↑ ${ByteFormat.bytes(rx)}↓" +
+                    " • ${ByteFormat.speed(currentSpeedTx)}↑ ${ByteFormat.speed(currentSpeedRx)}↓"
+            )
             .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setCategory(Notification.CATEGORY_SERVICE)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", disconnectPendingIntent)
             .addAction(android.R.drawable.ic_menu_revert, "Reconnect", reconnectPendingIntent)
-            .build()
+
+        // The exit IP and the latency were dead data: ACTION_NOTIFICATION_HEALTH
+        // set both fields and rebuilt this notification, which never referenced
+        // either one. They are the two things a user actually wants from the shade
+        // without opening the app, so they go in the subtext.
+        val health = listOf(currentVpnIp, currentPing).filter { it.isNotBlank() }
+        if (health.isNotEmpty()) builder.setSubText(health.joinToString(" · "))
+
+        return builder.build()
     }
-
-    private fun Builder.applySplitTunneling(): Builder {
-        val settings = SplitTunnelSettings(this@MsnGuardVpnService)
-        val mode = settings.mode()
-        val packages = settings.packages()
-
-        if (mode == SplitTunnelSettings.Mode.ALL) {
-            // GLOBAL: all apps through VPN, but MUST exclude ourselves to prevent routing loop.
-            addDisallowedApplication(packageName)
-            return this
-        }
-        if (mode == SplitTunnelSettings.Mode.INCLUDE) {
-            // INCLUDE (whitelist): only listed apps go through VPN.
-            // Do NOT add our own packageName — it's excluded by default.
-            // Do NOT use addDisallowedApplication here (mixing with addAllowedApplication crashes).
-        }
-        if (packages.isEmpty()) {
-            check(mode != SplitTunnelSettings.Mode.INCLUDE) {
-                "No apps selected for tunnel. Connection aborted for safety."
-            }
-            // EXCLUDE with empty list: nothing to exclude beyond ourselves.
-            addDisallowedApplication(packageName)
-            return this
-        }
-
-        var addedCount = 0
-        packages.forEach { pkg ->
-            try {
-                when (mode) {
-                    SplitTunnelSettings.Mode.INCLUDE -> {
-                        addAllowedApplication(pkg)
-                        addedCount++
-                    }
-                    SplitTunnelSettings.Mode.EXCLUDE -> {
-                        if (pkg != packageName) {
-                            addDisallowedApplication(pkg)
-                            addedCount++
-                        }
-                    }
-                }
-            } catch (_: android.content.pm.PackageManager.NameNotFoundException) {
-                Log.w(LOG_TAG, "Split tunnel skipped missing app: $pkg")
-            } catch (e: Exception) {
-                Log.e(LOG_TAG, "Failed to add $pkg to split tunnel: ${e.message}")
-            }
-        }
-
-        if (mode == SplitTunnelSettings.Mode.INCLUDE && addedCount == 0) {
-            error("Selected apps are no longer installed. Connection aborted.")
-        }
-
-        // EXCLUDE mode: also disallow our own app to prevent routing loop.
-        if (mode == SplitTunnelSettings.Mode.EXCLUDE) {
-            addDisallowedApplication(packageName)
-        }
-
-        ConnectionLog.record("Split tunnel ${mode.label.lowercase()}: $addedCount app(s)")
-        return this
-    }
-
-    private fun Builder.applyLanAccess(addresses: NativeCore.TunnelAddresses): Builder {
-        if (!lanBypassEnabled()) return this
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-            ConnectionLog.record("LAN access uses system local routes on Android 12 and older")
-            return this
-        }
-        val ranges = mutableListOf(
-            "10.0.0.0/8",
-            "192.168.0.0/16",
-            "fc00::/7",
-            "fe80::/10",
-        )
-        // Upstream v0.8.0: WARP/Zero Trust device and gateway addresses live in
-        // 172.16.0.0/12. Excluding that range would leak org DNS/gateway onto the
-        // LAN, so it is only bypassed when we are not on a WARP CGNAT identity.
-        if (!isWarpCgnat(addresses)) {
-            ranges.add(1, "172.16.0.0/12")
-        }
-        ranges.forEach { cidr ->
-            val (address, prefix) = cidr.split('/')
-            excludeRoute(IpPrefix(InetAddress.getByName(address), prefix.toInt()))
-        }
-        ConnectionLog.record("LAN routes bypass the VPN")
-        return this
-    }
-
-    /**
-     * Upstream v0.8.0 renamed the LAN preference from `lan_sharing` to
-     * `lan_bypass` and migrates the old value on first read. Kept verbatim so the
-     * service and the merged MainActivity agree on which key is authoritative.
-     */
-    private fun lanBypassEnabled(): Boolean {
-        val prefs = getSharedPreferences("settings", MODE_PRIVATE)
-        if (!prefs.contains("lan_bypass") && prefs.getBoolean("lan_sharing", false)) {
-            prefs.edit().putBoolean("lan_bypass", true).apply()
-            return true
-        }
-        return prefs.getBoolean("lan_bypass", false)
-    }
-
-    private fun Builder.applyTunnelAddresses(addresses: NativeCore.TunnelAddresses): Builder {
-        val v4 = parseTunnelAddress(addresses.ipv4, 32)
-            ?: error("Zero Trust identity has no usable IPv4 address")
-        addAddress(v4.first, v4.second)
-        addRoute("0.0.0.0", 0)
-        val v6 = parseTunnelAddress(addresses.ipv6, 128)
-        if (v6 != null) {
-            addAddress(v6.first, v6.second)
-            addRoute("::", 0)
-        }
-        return this
-    }
-
-    private fun Builder.applyGatewayProxy(
-        config: String,
-        addresses: NativeCore.TunnelAddresses,
-    ): Builder {
-        if (!JSONObject(config).optBoolean("gateway", false)) return this
-        val parsed = parseSocketAddress(addresses.gatewayProxy) ?: return this
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            setHttpProxy(ProxyInfo.buildDirectProxy(parsed.first, parsed.second))
-            ConnectionLog.record("Zero Trust gateway ${parsed.first}:${parsed.second}")
-        } else {
-            ConnectionLog.record("Gateway filtering in VPN mode needs Android 10 or newer")
-        }
-        return this
-    }
-
-    private fun parseTunnelAddress(raw: String, defaultPrefix: Int): Pair<InetAddress, Int>? {
-        val trimmed = raw.trim()
-        if (trimmed.isEmpty()) return null
-        val host = trimmed.substringBefore('/')
-        val prefix = trimmed.substringAfter('/', missingDelimiterValue = "")
-            .toIntOrNull() ?: defaultPrefix
-        val address = runCatching { InetAddress.getByName(host) }.getOrNull() ?: return null
-        val maxPrefix = if (address.address.size == 4) 32 else 128
-        return address to prefix.coerceIn(0, maxPrefix)
-    }
-
-    private fun parseSocketAddress(raw: String): Pair<String, Int>? {
-        val trimmed = raw.trim()
-        if (trimmed.isEmpty()) return null
-        return if (trimmed.startsWith('[')) {
-            val host = trimmed.substringAfter('[').substringBefore(']')
-            val port = trimmed.substringAfter("]:", "").toIntOrNull() ?: return null
-            host to port
-        } else {
-            val separator = trimmed.lastIndexOf(':')
-            if (separator <= 0) return null
-            val host = trimmed.substring(0, separator)
-            val port = trimmed.substring(separator + 1).toIntOrNull() ?: return null
-            host to port
-        }
-    }
-
-    private fun isWarpCgnat(addresses: NativeCore.TunnelAddresses): Boolean {
-        val host = addresses.ipv4.substringBefore('/').trim()
-        val octets = host.split('.')
-        if (octets.size == 4) {
-            val first = octets[0].toIntOrNull()
-            val second = octets[1].toIntOrNull()
-            if (first == 172 && second != null && second in 16..31) return true
-        }
-        return addresses.gatewayProxy.contains("172.16.") ||
-            addresses.gatewayProxy.contains("172.17.") ||
-            addresses.gatewayProxy.contains("172.18.")
-    }
-
-    private fun Builder.applyDns(config: String, addresses: NativeCore.TunnelAddresses): Builder {
-        // OURS, kept over upstream's version — this is load-bearing for Psiphon.
-        //
-        // Carrier DNS on Iranian mobile networks is both censored and rejected by
-        // Psiphon's SOCKS5 (reply 5), so public resolvers are forced first and any
-        // carrier-supplied server is filtered out rather than merely appended
-        // after. Upstream instead uses 1.1.1.1/1.0.0.1 only as a *fallback* when
-        // the config lists nothing, which would let carrier DNS through.
-        val forcedDns = listOf("1.1.1.1", "8.8.8.8")
-        forcedDns.forEach { addDnsServer(InetAddress.getByName(it)) }
-
-        // From upstream v0.8.0: advertise a v6 resolver when the identity has a
-        // v6 address, otherwise v6-only lookups have nowhere to go.
-        if (addresses.ipv6.isNotBlank()) {
-            runCatching { addDnsServer(InetAddress.getByName("2606:4700:4700::1111")) }
-        }
-
-        // Also add any DNS servers from config (for non-Psiphon protocols).
-        val configured = JSONObject(config).optString("dns_servers")
-        configured.split(',', ';', ' ', '\n')
-            .map(String::trim)
-            .filter(String::isNotEmpty)
-            .mapNotNull { entry ->
-                val address = when {
-                    entry.startsWith('[') -> entry.substringAfter('[').substringBefore(']')
-                    entry.count { it == ':' } == 1 -> entry.substringBefore(':')
-                    else -> entry
-                }
-                runCatching { InetAddress.getByName(address) }.getOrNull()
-            }
-            .distinct()
-            .filter { it.hostAddress !in forcedDns }
-            .forEach { addDnsServer(it) }
-
-        ConnectionLog.record("DNS forced to public resolvers, carrier DNS excluded")
-        return this
-    }
-}
-
-// ── ConnectionLog ──
-
-object ConnectionLog {
-    private const val MAX_ENTRIES = 100
-    private const val MAX_FILE_BYTES = 256 * 1024L
-    private val entries = ArrayDeque<String>()
-    private var sink: java.io.File? = null
-
-    /**
-     * Ported from upstream v0.8.0: mirror the ring buffer to a file so logs
-     * survive the process being killed. Required — the merged MainActivity calls
-     * this on startup. Capped and self-truncating so it cannot grow unbounded.
-     */
-    @Synchronized
-    fun bind(file: java.io.File) {
-        sink = file
-        if (file.exists() && file.length() > MAX_FILE_BYTES) {
-            file.delete()
-        }
-    }
-
-    @Synchronized
-    fun record(message: String) {
-        val line = "${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())}  $message"
-        if (entries.size == MAX_ENTRIES) entries.removeFirst()
-        entries.addLast(line)
-        runCatching { sink?.appendText(line + "\n") }
-    }
-
-    @Synchronized
-    fun snapshot(): List<String> = entries.toList()
 }
