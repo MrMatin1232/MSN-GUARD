@@ -7,15 +7,23 @@ import android.os.Build
 import android.provider.Settings
 import android.widget.LinearLayout
 import android.widget.ProgressBar
-import androidx.core.content.FileProvider
 import androidx.appcompat.app.AlertDialog
+import androidx.core.content.FileProvider
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
 
+/**
+ * In-app update check against the GitHub Releases API.
+ *
+ * Picks the first asset matching one of this device's supported ABIs, downloads
+ * it to the cache dir, and hands it to the package installer through a
+ * FileProvider URI.
+ */
 class AppUpdater(private val activity: Activity) {
     private val worker = Executors.newSingleThreadExecutor()
     private var pendingApk: File? = null
@@ -106,12 +114,15 @@ class AppUpdater(private val activity: Activity) {
             connectTimeout = 10_000
             readTimeout = 20_000
             setRequestProperty("Accept", "application/vnd.github+json")
-            setRequestProperty("User-Agent", "MSN-GUARD-Android")
+            setRequestProperty("User-Agent", USER_AGENT)
         }
         try {
-            if (connection.responseCode == HttpURLConnection.HTTP_NOT_FOUND) return null
-            check(connection.responseCode == HttpURLConnection.HTTP_OK) { "GitHub returned ${connection.responseCode}" }
-            val json = JSONObject(connection.inputStream.bufferedReader().use { reader -> reader.readText() })
+            // Read once: every access to responseCode can block on the response
+            // headers, and this used to be evaluated twice in a row.
+            val status = connection.responseCode
+            if (status == HttpURLConnection.HTTP_NOT_FOUND) return null
+            check(status == HttpURLConnection.HTTP_OK) { "GitHub returned $status" }
+            val json = JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
             val version = json.getString("tag_name").removePrefix("v")
             val assets = json.getJSONArray("assets")
             val apk = Build.SUPPORTED_ABIS.asSequence()
@@ -124,16 +135,12 @@ class AppUpdater(private val activity: Activity) {
         }
     }
 
-    private fun assetForAbi(assets: org.json.JSONArray, abi: String): Pair<String, String>? {
-        val token = when (abi) {
-            "arm64-v8a" -> "arm64-v8a"
-            "armeabi-v7a" -> "armeabi-v7a"
-            else -> abi
-        }
+    /** First `.apk` asset whose name mentions [abi]. */
+    private fun assetForAbi(assets: JSONArray, abi: String): Pair<String, String>? {
         for (index in 0 until assets.length()) {
             val asset = assets.getJSONObject(index)
             val name = asset.getString("name")
-            if (name.endsWith(".apk") && name.contains(token, ignoreCase = true)) {
+            if (name.endsWith(".apk") && name.contains(abi, ignoreCase = true)) {
                 return name to asset.getString("browser_download_url")
             }
         }
@@ -149,13 +156,13 @@ class AppUpdater(private val activity: Activity) {
         val connection = (URL(release.downloadUrl).openConnection() as HttpURLConnection).apply {
             connectTimeout = 10_000
             readTimeout = 30_000
-            setRequestProperty("User-Agent", "MSN-GUARD-Android")
+            setRequestProperty("User-Agent", USER_AGENT)
         }
         try {
-            check(connection.responseCode == HttpURLConnection.HTTP_OK) { "Download returned ${connection.responseCode}" }
+            val status = connection.responseCode
+            check(status == HttpURLConnection.HTTP_OK) { "Download returned $status" }
             val total = connection.contentLengthLong
             var downloaded = 0L
-            val digest = java.security.MessageDigest.getInstance("SHA-256")
             connection.inputStream.use { input ->
                 target.outputStream().use { output ->
                     val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
@@ -163,7 +170,6 @@ class AppUpdater(private val activity: Activity) {
                         val read = input.read(buffer)
                         if (read < 0) break
                         output.write(buffer, 0, read)
-                        digest.update(buffer, 0, read)
                         downloaded += read
                         if (total > 0) updateProgress((downloaded * 100 / total).toInt())
                     }
@@ -173,10 +179,15 @@ class AppUpdater(private val activity: Activity) {
             connection.disconnect()
         }
         check(target.length() > 0) { "Downloaded update is empty" }
+
+        // The real integrity gate: the archive has to parse as a package and its
+        // package name has to be ours. (A SHA-256 of the stream used to be
+        // computed here alongside it and then thrown away without ever being
+        // compared to anything.)
         val archiveInfo = activity.packageManager.getPackageArchiveInfo(target.absolutePath, 0)
-        check(archiveInfo != null && archiveInfo.packageName == activity.packageName) {
+        if (archiveInfo == null || archiveInfo.packageName != activity.packageName) {
             target.delete()
-            "Downloaded update is corrupted or package signature does not match"
+            error("Downloaded update is corrupted or its package name does not match")
         }
         return target
     }
@@ -223,8 +234,18 @@ class AppUpdater(private val activity: Activity) {
     private data class Release(val version: String, val assetName: String, val downloadUrl: String)
 
     private companion object {
-        const val RELEASE_HOST = "api.github.com"
-        const val RELEASE_URL = "https://$RELEASE_HOST/repos/mbm110/MSN-GUARD/releases/latest"
+        const val USER_AGENT = "MSN-GUARD-Android"
+
+        /**
+         * Release feed.
+         *
+         * Deliberately mbm110/MSN-GUARD and not whichever remote this working
+         * copy was cloned from: that is the repository the signed per-ABI APKs
+         * are published to (v1.1.4 at time of writing, matching versionName).
+         * Pointing this at a fork with no releases turns every update check into
+         * "No compatible release was found".
+         */
+        const val RELEASE_URL = "https://api.github.com/repos/mbm110/MSN-GUARD/releases/latest"
 
         fun isNewer(remote: String, local: String): Boolean {
             val remoteParts = remote.split('.', '-', '+').map { it.toIntOrNull() ?: 0 }

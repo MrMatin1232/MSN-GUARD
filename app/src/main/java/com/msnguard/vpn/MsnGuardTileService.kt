@@ -1,23 +1,27 @@
 package com.msnguard.vpn
 
+import android.app.PendingIntent
 import android.content.Intent
-import android.content.pm.ServiceInfo
 import android.graphics.drawable.Icon
+import android.net.VpnService
 import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
-import android.util.Log
-import android.net.VpnService
 
+/**
+ * Quick Settings tile: shows tunnel state and toggles it.
+ *
+ * Deliberately thin. It used to carry a private copy of MainActivity's entire
+ * settings layer — thirteen accessor methods, seven enums and fourteen pref keys
+ * — none of which anything called, because the tile builds its config the same
+ * way every other entry point does: [CoreConfig.json]. Duplicated defaults are
+ * worse than none, since the copy silently stops matching the original.
+ */
 class MsnGuardTileService : TileService() {
 
     override fun onTileAdded() {
         super.onTileAdded()
         updateTile()
-    }
-
-    override fun onTileRemoved() {
-        super.onTileRemoved()
     }
 
     override fun onStartListening() {
@@ -33,194 +37,70 @@ class MsnGuardTileService : TileService() {
     private fun updateTile() {
         val tile = qsTile ?: return
         val isConnected = TunnelStatus.isActive()
-        val state = if (isConnected) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
-
-        tile.state = state
-        tile.icon = Icon.createWithResource(
-            this,
-            R.drawable.ic_notification
-        )
+        tile.state = if (isConnected) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
+        tile.icon = Icon.createWithResource(this, R.drawable.ic_notification)
         tile.label = getString(R.string.vpn_tile_label)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            tile.subtitle = if (isConnected) getString(R.string.vpn_connected) else getString(R.string.vpn_disconnected)
-        }
+        tile.setSubtitleCompat(
+            if (isConnected) getString(R.string.vpn_connected) else getString(R.string.vpn_disconnected)
+        )
         tile.updateTile()
     }
 
     private fun toggleConnection() {
         val tile = qsTile ?: return
-        val isConnected = TunnelStatus.isActive()
 
-        if (isConnected) {
-            // Disconnect
-            startService(Intent(this, MsnGuardVpnService::class.java).setAction(MsnGuardVpnService.ACTION_DISCONNECT))
+        if (TunnelStatus.isActive()) {
+            startService(serviceIntent(MsnGuardVpnService.ACTION_DISCONNECT))
             tile.state = Tile.STATE_INACTIVE
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                tile.subtitle = getString(R.string.vpn_disconnected)
-            }
+            tile.setSubtitleCompat(getString(R.string.vpn_disconnected))
             tile.updateTile()
+            return
+        }
+
+        // VPN mode is the only mode, so Android's VPN consent is always required
+        // before the service may build a TUN. A TileService cannot host that
+        // dialog, so when consent is missing the only useful action is to open the
+        // app — which is exactly what this used to skip, leaving the tap looking
+        // broken with nothing but a logcat line to explain it.
+        if (VpnService.prepare(this) != null) {
+            openApp()
+            return
+        }
+
+        startForegroundService(
+            serviceIntent(MsnGuardVpnService.ACTION_CONNECT)
+                .putExtra(MsnGuardVpnService.EXTRA_CONFIG, CoreConfig.json(this))
+        )
+        tile.state = Tile.STATE_ACTIVE
+        tile.setSubtitleCompat(getString(R.string.vpn_connecting))
+        tile.updateTile()
+    }
+
+    private fun serviceIntent(action: String): Intent =
+        Intent(this, MsnGuardVpnService::class.java).setAction(action)
+
+    /**
+     * Opens MainActivity and collapses the shade.
+     *
+     * API 34 made the Intent overload of startActivityAndCollapse throw
+     * UnsupportedOperationException and replaced it with a PendingIntent one, so
+     * both forms are needed while minSdk is 26.
+     */
+    private fun openApp() {
+        val intent = Intent(this, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startActivityAndCollapse(
+                PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE)
+            )
         } else {
-            // Connect. VPN mode is the only mode, so Android's VPN consent is
-            // always required before the service may build a TUN.
-            val permissionIntent = VpnService.prepare(this)
-            if (permissionIntent == null) {
-                // Already have permission
-                val config = configJson()
-                startForegroundService(
-                    Intent(this, MsnGuardVpnService::class.java)
-                        .setAction(MsnGuardVpnService.ACTION_CONNECT)
-                        .putExtra(MsnGuardVpnService.EXTRA_CONFIG, config)
-                )
-                tile.state = Tile.STATE_ACTIVE
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    tile.subtitle = getString(R.string.vpn_connecting)
-                }
-                tile.updateTile()
-            } else {
-                // Need to ask for permission - can't start activity from here
-                Log.w(LOG_TAG, "VPN permission required, cannot start from tile")
-            }
+            @Suppress("DEPRECATION")
+            startActivityAndCollapse(intent)
         }
     }
 
-    private fun configJson(): String = CoreConfig.json(this)
-
-    private val selectedProtocolcoreName: String
-        get() = getSharedPreferences(SETTINGS, MODE_PRIVATE)
-            .getString(DEFAULT_PROTOCOL, Protocol.MASQUE.coreName)
-            ?.let { name -> Protocol.entries.find { it.coreName == name } }
-            ?.coreName ?: Protocol.MASQUE.coreName
-
-    private fun defaultScan(): ScanTarget {
-        val name = getSharedPreferences(SETTINGS, MODE_PRIVATE).getString(DEFAULT_SCAN, ScanTarget.IPV4.coreName)
-        return ScanTarget.entries.find { it.coreName == name } ?: ScanTarget.IPV4
-    }
-
-    private fun defaultScanMode(): ScanMode {
-        val name = getSharedPreferences(SETTINGS, MODE_PRIVATE).getString(DEFAULT_SCAN_MODE, ScanMode.BALANCED.coreName)
-        return ScanMode.entries.find { it.coreName == name } ?: ScanMode.BALANCED
-    }
-
-    private fun defaultEndpointDiscovery(): EndpointDiscovery {
-        val name = getSharedPreferences(SETTINGS, MODE_PRIVATE)
-            .getString(ENDPOINT_DISCOVERY, EndpointDiscovery.CACHE.coreName)
-        return EndpointDiscovery.entries.find { it.coreName == name } ?: EndpointDiscovery.CACHE
-    }
-
-    private fun defaultMasqueTransport(): MasqueTransport {
-        val name = getSharedPreferences(SETTINGS, MODE_PRIVATE)
-            .getString(DEFAULT_MASQUE_TRANSPORT, MasqueTransport.H3.coreName)
-        return MasqueTransport.entries.find { it.coreName == name } ?: MasqueTransport.H3
-    }
-
-    private fun obfuscationProfile(): ObfuscationProfile = getSharedPreferences(SETTINGS, MODE_PRIVATE)
-        .getString(OBFUSCATION_PROFILE, ObfuscationProfile.BALANCED.coreName)
-        ?.let { name -> ObfuscationProfile.entries.find { it.coreName == name } }
-        ?: ObfuscationProfile.BALANCED
-
-    private fun manualEndpoint(): String? = getSharedPreferences(SETTINGS, MODE_PRIVATE)
-        .getString(MANUAL_ENDPOINT, null)?.takeIf { it.isNotBlank() }
-
-    private fun retryObfuscationProfiles(): Boolean = getSharedPreferences(SETTINGS, MODE_PRIVATE)
-        .getBoolean(RETRY_OBFUSCATION, true)
-
-    private fun tlsCurvePreset(): TlsCurvePreset = getSharedPreferences(SETTINGS, MODE_PRIVATE)
-        .getString(TLS_CURVE_PRESET, TlsCurvePreset.CHROME.coreName)
-        ?.let { name -> TlsCurvePreset.entries.find { it.coreName == name } }
-        ?: TlsCurvePreset.CHROME
-
-    private fun wireGuardDataCheck(): Boolean = getSharedPreferences(SETTINGS, MODE_PRIVATE)
-        .getBoolean(WIREGUARD_DATA_CHECK, true)
-
-    private fun logLevel(): String = getSharedPreferences(SETTINGS, MODE_PRIVATE)
-        .getString(LOG_LEVEL, "info") ?: "info"
-
-    private fun perfProfile(): String = getSharedPreferences(SETTINGS, MODE_PRIVATE)
-        .getString(PERF_PROFILE, "auto") ?: "auto"
-
-    private fun h2Fragmentation(): Boolean = getSharedPreferences(SETTINGS, MODE_PRIVATE)
-        .getString(H2_FRAGMENTATION, "on") == "on"
-
-    companion object {
-        private const val LOG_TAG = "AetherTile"
-
-        // From MainActivity
-        const val SETTINGS = "settings"
-        const val DEFAULT_SCAN = "default_scan"
-        const val DEFAULT_SCAN_MODE = "default_scan_mode"
-        const val ENDPOINT_DISCOVERY = "endpoint_discovery"
-        const val DEFAULT_MASQUE_TRANSPORT = "default_masque_transport"
-        const val OBFUSCATION_PROFILE = "obfuscation_profile"
-        const val MANUAL_ENDPOINT = "manual_endpoint"
-        const val RETRY_OBFUSCATION = "retry_obfuscation_profiles"
-        const val TLS_CURVE_PRESET = "tls_curve_preset"
-        const val WIREGUARD_DATA_CHECK = "wireguard_data_check"
-        const val LOG_LEVEL = "log_level"
-        const val PERF_PROFILE = "perf_profile"
-        const val H2_FRAGMENTATION = "h2_fragmentation"
-        const val DEFAULT_PROTOCOL = "default_protocol"
-
-        enum class Protocol(
-            val label: String,
-            val coreName: String,
-            val description: String,
-        ) {
-            MASQUE("MASQUE", "masque", "HTTP/3 tunnel"),
-            WIREGUARD("WireGuard", "wireguard", "WireGuard tunnel"),
-            WARP_IN_WARP("WARP-on-WARP", "gool", "Double-layer tunnel"),
-            PSIPHON("Psiphon", "psiphon", "SOCKS5 proxy tunnel"),
-        }
-
-        enum class ScanTarget(
-            val label: String,
-            val coreName: String,
-            val description: String,
-        ) {
-            IPV4("IPv4", "v4", "Scan IPv4 endpoints only"),
-            IPV6("IPv6", "v6", "Scan IPv6 endpoints only"),
-            BOTH("Both", "both", "Scan IPv4 and IPv6 endpoints"),
-        }
-
-        enum class ScanMode(
-            val label: String,
-            val coreName: String,
-            val description: String,
-        ) {
-            TURBO("Turbo", "turbo", "Fastest scan; first verified route wins"),
-            BALANCED("Balanced", "balanced", "Default mix of speed and coverage"),
-            THOROUGH("Thorough", "thorough", "Deep scan; selects best latency"),
-            STEALTH("Stealth", "stealth", "Quiet, patient probing"),
-            IRONCLAD("Ironclad", "ironclad", "Strict CONNECT-IP verification before selection"),
-        }
-
-        enum class EndpointDiscovery(
-            val label: String,
-            val coreName: String,
-            val description: String,
-        ) {
-            CACHE("Cache & refresh", "cache", "Use verified gateways first, then discover more"),
-            FRESH("Fresh scan", "fresh", "Start a new scan every connection"),
-        }
-
-        enum class MasqueTransport(
-            val label: String,
-            val coreName: String,
-            val description: String,
-        ) {
-            H3("HTTP/3", "h3", "QUIC; best on healthy UDP networks"),
-            H2("HTTP/2", "h2", "TCP; use when UDP or QUIC is blocked"),
-        }
-
-        enum class ObfuscationProfile(val label: String, val coreName: String, val description: String) {
-            OFF("Off", "off", "No traffic-shape padding"),
-            LIGHT("Light", "light", "Lower overhead on mild filtering"),
-            BALANCED("Balanced", "balanced", "Recommended filtering resistance"),
-            AGGRESSIVE("Aggressive", "aggressive", "Highest resistance; slower setup"),
-        }
-
-        enum class TlsCurvePreset(val label: String, val coreName: String, val description: String) {
-            CHROME("Chrome", "chrome", "Chrome TLS curve ordering"),
-            COMPATIBILITY("Compatibility", "compatibility", "P-256 and X25519 only"),
-        }
+    /** Tile.setSubtitle is API 29+; below that the tile simply has no subtitle. */
+    private fun Tile.setSubtitleCompat(value: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) subtitle = value
     }
 }

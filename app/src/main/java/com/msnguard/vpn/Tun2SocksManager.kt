@@ -91,7 +91,7 @@ object Tun2SocksManager {
 
         val interfaces = try {
             NetworkInterface.getNetworkInterfaces()
-        } catch (e: SocketException) {
+        } catch (_: SocketException) {
             null
         }
 
@@ -102,10 +102,8 @@ object Tun2SocksManager {
                     val ip = inetAddress.hostAddress ?: continue
                     when {
                         ip.startsWith("10.") -> candidates.remove("10")
-                        ip.length >= 6 &&
-                            ip.substring(0, 6) >= "172.16" &&
-                            ip.substring(0, 6) <= "172.31" -> candidates.remove("172")
-                        ip.startsWith("192.168") -> candidates.remove("192")
+                        isRfc1918Class172(ip) -> candidates.remove("172")
+                        ip.startsWith("192.168.") -> candidates.remove("192")
                     }
                 }
             }
@@ -115,6 +113,23 @@ object Tun2SocksManager {
         privateAddress = selected
         ConnectionLog.record("tun2socks address plan: if=${selected.ipAddress}/${selected.prefixLength} router=${selected.router}")
         return selected
+    }
+
+    /**
+     * True when [ip] is inside 172.16.0.0/12.
+     *
+     * The previous version compared `ip.substring(0, 6)` against the strings
+     * "172.16" and "172.31" lexicographically, which is not a numeric range test.
+     * "172.160.4.1" — a public address — has the prefix "172.16" and was therefore
+     * treated as private, which retired a usable candidate range for no reason,
+     * and any address shorter than six characters was compared on a truncated
+     * prefix. Parsing the second octet is both correct and clearer.
+     */
+    private fun isRfc1918Class172(ip: String): Boolean {
+        val octets = ip.split('.')
+        if (octets.size != 4 || octets[0] != "172") return false
+        val second = octets[1].toIntOrNull() ?: return false
+        return second in 16..31
     }
 
     val isRunning: Boolean
@@ -153,7 +168,7 @@ object Tun2SocksManager {
         if (previous != null && previous.isAlive) {
             try {
                 previous.join(NATIVE_EXIT_GRACE_MS)
-            } catch (e: InterruptedException) {
+            } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
             if (previous.isAlive) {
