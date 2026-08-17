@@ -234,16 +234,28 @@ class OrbitSettingsRow(
     /** Presses sink inward: the highlight and the occlusion swap places. */
     override fun setPressed(pressed: Boolean) {
         super.setPressed(pressed)
-        background = when {
-            pressed -> pressedBackground
-            isFocused -> focusedBackground
-            else -> restingBackground
-        }
+        syncBackground()
     }
 
     override fun onFocusChanged(gainFocus: Boolean, direction: Int, rect: android.graphics.Rect?) {
         super.onFocusChanged(gainFocus, direction, rect)
-        background = if (gainFocus) focusedBackground else restingBackground
+        syncBackground()
+    }
+
+    /**
+     * One place that decides which of the three backgrounds is current.
+     *
+     * onFocusChanged used to set resting/focused directly without consulting
+     * isPressed, so a D-pad focus change (or a focus steal) while a finger was
+     * down repainted the row as raised mid-press. Both entry points now resolve
+     * the same precedence.
+     */
+    private fun syncBackground() {
+        background = when {
+            isPressed -> pressedBackground
+            isFocused -> focusedBackground
+            else -> restingBackground
+        }
     }
 
     fun setValue(value: String?) {
@@ -388,7 +400,10 @@ class OrbitToggleRow(
 
     private fun renderSwitch() {
         track.background = if (isOn) {
-            LitTrack(context, palette.primary, dp(trackHeightDp()).toFloat())
+            // trackHeight is already in pixels; there used to be a
+            // trackHeightDp() helper here returning a second copy of the literal
+            // 27, which was then run through dp() again at this call site.
+            LitTrack(context, palette.primary, trackHeight.toFloat())
         } else {
             Sculpt.recessedBackground(
                 density,
@@ -404,8 +419,6 @@ class OrbitToggleRow(
             accent = if (isOn) 0xFFFFFFFF.toInt() else null,
         )
     }
-
-    private fun trackHeightDp(): Int = 27
 
     private fun syncDescription() {
         val label = "$title, ${if (isOn) "on" else "off"}"
